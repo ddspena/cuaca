@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cuaca BMKG di OpenStreetMap</title>
+
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: system-ui, sans-serif; }
+
+        #map { height: 100vh; width: 100%; }
+
+        /* Panel kontrol di pojok kiri atas */
+        .panel {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            z-index: 1000;
+            background: white;
+            padding: 12px 16px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            min-width: 240px;
+        }
+
+        .panel label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 6px;
+            font-size: 14px;
+        }
+
+        .panel select {
+            width: 100%;
+            padding: 6px 8px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        /* Gaya popup cuaca */
+        .weather-popup {
+            min-width: 220px;
+            font-size: 14px;
+        }
+
+        .weather-popup h3 {
+            margin: 0 0 6px;
+            font-size: 16px;
+        }
+
+        .weather-popup .temp {
+            font-size: 28px;
+            font-weight: 700;
+            margin: 4px 0;
+        }
+
+        .weather-popup .desc {
+            color: #555;
+            margin-bottom: 8px;
+        }
+
+        .weather-popup .detail {
+            display: flex;
+            justify-content: space-between;
+            padding: 2px 0;
+            border-top: 1px solid #eee;
+        }
+
+        .weather-popup .detail span:first-child {
+            color: #777;
+        }
+
+        .attribution {
+            position: absolute;
+            bottom: 4px;
+            right: 4px;
+            z-index: 1000;
+            background: rgba(255,255,255,0.9);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+            color: #333;
+        }
+
+        .attribution a { color: #0066cc; }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <!-- Panel pilihan kota -->
+    <div class="panel">
+        <label for="citySelect">Pilih kota:</label>
+        <select id="citySelect">
+            <option value="">— Pilih kota —</option>
+        </select>
+    </div>
+
+    <!-- Atribusi BMKG -->
+    <div class="attribution">
+        Sumber data: <a href="https://data.bmkg.go.id/prakiraan-cuaca/" target="_blank" rel="noopener">BMKG</a>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <script>
+        // ============================================================
+        // 1. Daftar kota contoh (kode ADM4 tingkat kelurahan/desa)
+        //    Kode ADM4 format: XX.XX.XX.XXXX
+        //    Contoh dari dokumentasi BMKG:
+        //    31.71.03.1001 = Kemayoran, Jakarta Pusat
+        //    35.07.01.1001 = Surabaya
+        // ============================================================
+        const CITIES = [
+            { name: 'Jakarta (Kemayoran)',  adm4: '31.71.03.1001', lat: -6.155, lon: 106.845 },
+            { name: 'Surabaya',            adm4: '35.07.01.1001', lat: -7.257, lon: 112.752 },
+            { name: 'Bandung (Sukasari)',   adm4: '32.73.01.1001', lat: -6.875, lon: 107.600 },
+            { name: 'Medan',               adm4: '12.71.01.1001', lat: 3.595,  lon: 98.672  },
+            { name: 'Makassar',            adm4: '73.71.01.1001', lat: -5.147, lon: 119.432 }
+        ];
+
+        // ============================================================
+        // 2. Inisialisasi peta Leaflet + tile OpenStreetMap
+        // ============================================================
+        const map = L.map('map').setView([-2.5, 118], 5); // fokus Indonesia
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        // ============================================================
+        // 3. Fungsi mengambil data cuaca dari BMKG
+        //    Menggunakan proxy CORS karena API BMKG tidak mengizinkan
+        //    request langsung dari browser (CORS).
+        // ============================================================
+        const CORS_PROXY = 'https://corsproxy.io/?';
+
+        async function fetchWeather(adm4) {
+            const targetUrl = `https://api.bmkg.go.id/publik/prakiraan-cuaca?adm4=${adm4}`;
+            const url = CORS_PROXY + encodeURIComponent(targetUrl);
+
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const json = await response.json();
+            return json;
+        }
+
+        // ============================================================
+        // 4. Format popup HTML dari data BMKG
+        //    Struktur JSON BMKG (disederhanakan):
+        //    {
+        //      "lokasi": { "desa": "...", "kecamatan": "...", ... },
+        //      "data": [ { "cuaca": [ [slot1, slot2, ...], ... ] } ]
+        //    }
+        //    Setiap slot memiliki field: local_datetime, t, hu,
+        //    weather_desc, ws, wd, dll.
+        // ============================================================
+        function buildPopupHtml(cityName, data) {
+            // Ambil slot pertama (prakiraan terdekat)
+            const slot = data?.data?.[0]?.cuaca?.[0]?.[0];
+            if (!slot) {
+                return `<div class="weather-popup"><strong>${cityName}</strong><br>Data cuaca tidak tersedia.</div>`;
+            }
+
+            const lokasi = data.lokasi || {};
+            const desa = lokasi.desa || '';
+            const kecamatan = lokasi.kecamatan || '';
+
+            return `
+                <div class="weather-popup">
+                    <h3>${cityName}</h3>
+                    <div style="font-size:12px;color:#777;margin-bottom:6px;">
+                        ${desa}${kecamatan ? ', ' + kecamatan : ''}
+                    </div>
+                    <div class="temp">${slot.t ?? '-'}°C</div>
+                    <div class="desc">${slot.weather_desc ?? '-'}</div>
+                    <div class="detail"><span>Kelembapan</span><span>${slot.hu ?? '-'}%</span></div>
+                    <div class="detail"><span>Angin</span><span>${slot.ws ?? '-'} km/jam ${slot.wd ?? ''}</span></div>
+                    <div class="detail"><span>Waktu</span><span>${slot.local_datetime ?? '-'}</span></div>
+                </div>
+            `;
+        }
+
+        // ============================================================
+        // 5. Muat semua kota: ambil data, buat marker, simpan referensi
+        // ============================================================
+        const markerMap = new Map(); // adm4 -> marker
+
+        async function loadAllCities() {
+            for (const city of CITIES) {
+                try {
+                    const data = await fetchWeather(city.adm4);
+                    const popupHtml = buildPopupHtml(city.name, data);
+
+                    const marker = L.marker([city.lat, city.lon])
+                        .addTo(map)
+                        .bindPopup(popupHtml);
+
+                    // Simpan marker agar bisa dibuka dari dropdown
+                    markerMap.set(city.adm4, marker);
+
+                    // Isi dropdown
+                    const opt = document.createElement('option');
+                    opt.value = city.adm4;
+                    opt.textContent = city.name;
+                    document.getElementById('citySelect').appendChild(opt);
+
+                } catch (err) {
+                    console.error(`Gagal memuat cuaca untuk ${city.name}:`, err);
+                    // Tetap tambahkan marker dengan pesan error
+                    const marker = L.marker([city.lat, city.lon])
+                        .addTo(map)
+                        .bindPopup(`<strong>${city.name}</strong><br>Gagal memuat data cuaca.`);
+                    markerMap.set(city.adm4, marker);
+                }
+            }
+        }
+
+        // ============================================================
+        // 6. Event: pilih kota dari dropdown → buka popup marker
+        // ============================================================
+        document.getElementById('citySelect').addEventListener('change', function (e) {
+            const adm4 = e.target.value;
+            if (!adm4) return;
+
+            const marker = markerMap.get(adm4);
+            if (marker) {
+                map.setView(marker.getLatLng(), 10);
+                marker.openPopup();
+            }
+        });
+
+        // ============================================================
+        // 7. Jalankan
+        // ============================================================
+        loadAllCities();
+
+    </script>
+</body>
+</html>
